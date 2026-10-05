@@ -116,6 +116,22 @@ When using Hardcover you must set the `hardcover-auth` parameter.
 Note that your API key **will expire every year on January 1**, so you'll need
 to periodically regenerate it.
 
+### Hardcover bibliography diagnostics
+
+The `hardcover-king-diagnostics.1` image is a private GHCR diagnostic build for
+investigating a single author refresh. It does not alter Hardcover queries,
+candidate selection, cache keys, or returned metadata. Set
+`HARDCOVER_DIAGNOSTIC_AUTHOR_IDS` to a comma-separated list of numeric Hardcover
+author IDs; only those authors emit `hardcover_bibliography` structured records.
+
+The workflow **publish Hardcover diagnostics** builds the `rghc` binary and
+publishes `ghcr.io/jmsloat/rreading-glasses:<tag>`. Record the workflow's
+resulting manifest digest and the fork commit in the deployment runbook, set
+package visibility to private, and deploy only the digest reference. Operators
+must authenticate to GHCR before pulling the private package. Each configured
+author refresh emits one `refreshID`-correlated summary with stage and terminal
+outcome counts; do not log or share the Hardcover authorization value.
+
 ### Resource Requirements
 
 Resource requirements are minimal; a Raspberry Pi should suffice. Storage

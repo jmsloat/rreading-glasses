@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"io"
 	"iter"
+	"log/slog"
 	"maps"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -90,7 +92,8 @@ type Controller struct {
 	// workG collects work refreshes.
 	workG errgroup.Group
 
-	metrics *controllerMetrics
+	metrics     *controllerMetrics
+	diagnostics hardcoverDiagnostics
 }
 
 // getter allows alternative implementations of the core logic to be injected.
@@ -173,10 +176,11 @@ func NewUpstream(host string, proxy string) (*http.Client, error) {
 func NewController(cache cache[[]byte], getter getter, persister persister, reg *prometheus.Registry) (*Controller, error) {
 	metrics := newControllerMetrics(reg)
 	c := &Controller{
-		cache:     cache,
-		getter:    getter,
-		persister: &nopersist{},
-		metrics:   metrics,
+		cache:       cache,
+		getter:      getter,
+		persister:   &nopersist{},
+		metrics:     metrics,
+		diagnostics: newHardcoverDiagnostics(os.Getenv("HARDCOVER_DIAGNOSTIC_AUTHOR_IDS")),
 
 		denormC:  make(chan edge),
 		refreshC: make(chan refreshAuthor),
@@ -698,10 +702,11 @@ type refreshAuthor struct {
 
 func (c *Controller) refreshAuthor(ctx context.Context, authorID int64, cachedBytes []byte) {
 	ctx = context.WithValue(ctx, middleware.RequestIDKey, fmt.Sprintf("refresh-author-%d", authorID))
-
+	ctx, diagnostic := c.diagnostics.withRefresh(ctx, authorID)
 	defer func() {
 		if r := recover(); r != nil {
 			Log(ctx).Error("panic", "details", r)
+			diagnostic.summary(ctx, "panic")
 		}
 	}()
 
@@ -718,20 +723,30 @@ func (c *Controller) refreshAuthor(ctx context.Context, authorID int64, cachedBy
 		}
 		bookBytes, _, err := c.GetBook(ctx, bookID)
 		if err != nil {
+			diagnostic.event(ctx, "edition_fetch", "fetch_failed", slog.Int64("editionID", bookID), slog.String("err", err.Error()))
 			Log(ctx).Warn("problem getting book for author", "authorID", authorID, "bookID", bookID, "err", err)
 			continue
 		}
 		var w workResource
-		_ = json.Unmarshal(bookBytes, &w)
+		if err := json.Unmarshal(bookBytes, &w); err != nil {
+			diagnostic.event(ctx, "edition_decode", "map_failed", slog.Int64("editionID", bookID), slog.String("err", err.Error()))
+			continue
+		}
 
-		if len(w.Authors) > 0 && w.Authors[0].ForeignID != authorID {
+		if len(w.Authors) == 0 {
+			diagnostic.event(ctx, "edition_validation", "skipped_no_primary_author", slog.Int64("editionID", bookID), slog.Int64("workID", w.ForeignID))
+		} else if w.Authors[0].ForeignID != authorID {
+			diagnostic.event(ctx, "edition_validation", "skipped_primary_author_mismatch", slog.Int64("editionID", bookID), slog.Int64("workID", w.ForeignID), slog.Int64("primaryAuthorID", w.Authors[0].ForeignID))
 			Log(ctx).Debug("skipping edition due to author mismatch", "authorID", authorID, "got", w.Authors[0].ForeignID)
 			continue
 		}
 
 		workID := w.ForeignID
 		if _, _, err := c.GetWork(ctx, workID); err == nil { // Ensure fetched before denormalizing.
+			diagnostic.event(ctx, "work_fetch", "selected", slog.Int64("editionID", bookID), slog.Int64("workID", workID))
 			workIDSToDenormalize = append(workIDSToDenormalize, workID)
+		} else {
+			diagnostic.event(ctx, "work_fetch", "fetch_failed", slog.Int64("editionID", bookID), slog.Int64("workID", workID), slog.String("err", err.Error()))
 		}
 		n++
 	}
@@ -739,10 +754,12 @@ func (c *Controller) refreshAuthor(ctx context.Context, authorID int64, cachedBy
 	slices.Sort(workIDSToDenormalize)
 	workIDSToDenormalize = slices.Compact(workIDSToDenormalize)
 
+	diagnostic.event(ctx, "refresh", "queued", slog.Int("workCount", len(workIDSToDenormalize)))
+
 	if len(workIDSToDenormalize) > 0 {
-		c.denormC <- edge{kind: authorEdge, parentID: authorID, childIDs: newSet(workIDSToDenormalize...)}
+		c.denormC <- edge{kind: authorEdge, parentID: authorID, childIDs: newSet(workIDSToDenormalize...), diagnostic: diagnostic}
 	}
-	c.denormC <- edge{kind: refreshDone, parentID: authorID}
+	c.denormC <- edge{kind: refreshDone, parentID: authorID, diagnostic: diagnostic}
 	Log(ctx).Info("fetched all works for author", "authorID", authorID, "count", len(workIDSToDenormalize), "duration", time.Since(start).String())
 }
 
@@ -793,6 +810,9 @@ func (c *Controller) Run(ctx context.Context) {
 	for edge := range denorms {
 		ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
 		ctx = context.WithValue(ctx, middleware.RequestIDKey, fmt.Sprintf("denorm-%d-%d", edge.kind, edge.parentID))
+		if edge.diagnostic != nil {
+			ctx = context.WithValue(ctx, hardcoverDiagnosticContextKey{}, edge.diagnostic)
+		}
 
 		switch edge.kind {
 		case authorEdge:
@@ -808,6 +828,9 @@ func (c *Controller) Run(ctx context.Context) {
 			}
 		case refreshDone:
 			c.metrics.refreshWaitingAdd(-1)
+			if edge.diagnostic != nil {
+				edge.diagnostic.summary(ctx, "completed")
+			}
 			if err := c.persister.Delete(ctx, edge.parentID); err != nil {
 				Log(ctx).Warn("problem un-persisting refresh", "err", err)
 			}
@@ -961,9 +984,14 @@ func (c *Controller) denormalizeWorks(ctx context.Context, authorID int64, workI
 
 	Log(ctx).Debug("ensuring author-work edges", "authorID", authorID, "workIDs", workIDs)
 
-	for _, workID := range workIDs {
+	diagnostic := diagnosticRefresh(ctx)
+	for _, requestedWorkID := range workIDs {
+		workID := requestedWorkID
 		workBytes, _, err := c.getter.GetWork(ctx, workID, nil)
 		if err != nil {
+			if diagnostic != nil {
+				diagnostic.event(ctx, "denormalize", "fetch_failed", slog.Int64("requestedWorkID", requestedWorkID), slog.String("err", err.Error()))
+			}
 			// Maybe the cache wasn't able to refresh because it was deleted? Move on.
 			Log(ctx).Warn("unable to denormalize work", "err", err, "authorID", authorID, "workID", workID)
 			continue
@@ -971,25 +999,40 @@ func (c *Controller) denormalizeWorks(ctx context.Context, authorID int64, workI
 		var work workResource
 		err = sonic.ConfigStd.Unmarshal(workBytes, &work)
 		if err != nil {
+			if diagnostic != nil {
+				diagnostic.event(ctx, "denormalize", "map_failed", slog.Int64("requestedWorkID", requestedWorkID), slog.String("err", err.Error()))
+			}
 			Log(ctx).Warn("problem unmarshaling work", "err", err, "workID", workID)
 			_ = c.cache.Expire(ctx, WorkKey(workID))
 			continue
 		}
 		workID = work.ForeignID // GetWork can return a merged work with a different ID.
+		if diagnostic != nil && workID != requestedWorkID {
+			diagnostic.event(ctx, "denormalize", "canonicalized", slog.Int64("requestedWorkID", requestedWorkID), slog.Int64("canonicalWorkID", workID))
+		}
 
 		idx, found := slices.BinarySearchFunc(author.Works, workID, func(w workResource, id int64) int {
 			return cmp.Compare(w.ForeignID, id)
 		})
 
 		if len(work.Books) == 0 {
+			if diagnostic != nil {
+				diagnostic.event(ctx, "denormalize", "skipped_no_edition", slog.Int64("workID", workID))
+			}
 			Log(ctx).Warn("work had no editions", "workID", workID)
 			continue
 		}
 
 		if found {
 			author.Works[idx] = work // Replace.
+			if diagnostic != nil {
+				diagnostic.event(ctx, "denormalize", "replaced", slog.Int64("workID", workID))
+			}
 		} else {
 			author.Works = slices.Insert(author.Works, idx, work) // Insert.
+			if diagnostic != nil {
+				diagnostic.event(ctx, "denormalize", "inserted", slog.Int64("workID", workID))
+			}
 		}
 	}
 

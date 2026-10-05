@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"log/slog"
 	"maps"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -21,15 +23,20 @@ import (
 // attempts to minimize upstream HEAD requests (to resolve book/work IDs) by
 // relying on HC's raw external data.
 type HCGetter struct {
-	cache cache[[]byte]
-	gql   graphql.Client
+	cache       cache[[]byte]
+	gql         graphql.Client
+	diagnostics hardcoverDiagnostics
 }
 
 var _ getter = (*HCGetter)(nil)
 
 // NewHardcoverGetter returns a new Getter backed by Hardcover.
 func NewHardcoverGetter(cache cache[[]byte], gql graphql.Client) (*HCGetter, error) {
-	return &HCGetter{cache: cache, gql: gql}, nil
+	return &HCGetter{
+		cache:       cache,
+		gql:         gql,
+		diagnostics: newHardcoverDiagnostics(os.Getenv("HARDCOVER_DIAGNOSTIC_AUTHOR_IDS")),
+	}, nil
 }
 
 // Search hits the GraphQL endpoint to fetch relevant work IDs and then fetches
@@ -331,6 +338,7 @@ func mapHardcoverToWorkResource(ctx context.Context, edition hardcover.EditionIn
 // GetAuthorBooks returns all GR book (edition) IDs.
 func (g *HCGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[int64] {
 	return func(yield func(int64) bool) {
+		diagnostic := diagnosticRefresh(ctx)
 		limit, offset := int64(100), int64(0)
 		for {
 			editions, err := hardcover.GetAuthorEditions(ctx, g.gql, authorID, limit, offset)
@@ -344,17 +352,34 @@ func (g *HCGetter) GetAuthorBooks(ctx context.Context, authorID int64) iter.Seq[
 			}
 
 			for _, c := range editions.Authors_by_pk.Contributions {
+				contributors := diagnosticContributors(hardcover.AsContributions(c.Book.Contributions))
 				author, err := bestAuthor(hardcover.AsContributions(c.Book.Contributions))
 				if err != nil {
+					if diagnostic != nil {
+						diagnostic.event(ctx, "source_candidate", "skipped_no_primary_author", slog.Int64("candidateWorkID", c.Book.Id), slog.Any("contributors", contributors), slog.String("err", err.Error()))
+					}
 					continue
 				}
 				if author.Id != authorID {
+					if diagnostic != nil {
+						diagnostic.event(ctx, "source_candidate", "skipped_primary_author_mismatch", slog.Int64("candidateWorkID", c.Book.Id), slog.Any("contributors", contributors), slog.Int64("primaryAuthorID", author.Id))
+					}
 					continue // Ignore anything that doesn't have this as the primary author.
 				}
 
 				editionID := bestHardcoverEdition(c.Book.DefaultEditions, authorID)
 				if editionID == 0 {
-					continue // Shouldn't happen.
+					outcome := "skipped_no_edition"
+					if len(c.Book.DefaultEditions.Fallback) > 1 {
+						outcome = "skipped_ambiguous_edition"
+					}
+					if diagnostic != nil {
+						diagnostic.event(ctx, "source_candidate", outcome, slog.Int64("candidateWorkID", c.Book.Id), slog.Any("contributors", contributors))
+					}
+					continue
+				}
+				if diagnostic != nil {
+					diagnostic.event(ctx, "source_candidate", "selected", slog.Int64("candidateWorkID", c.Book.Id), slog.Int64("editionID", editionID), slog.Any("contributors", contributors))
 				}
 				if !yield(editionID) {
 					return
@@ -436,6 +461,17 @@ func bestHardcoverEdition(defaults hardcover.DefaultEditions, expectedAuthorID i
 	}
 
 	return defaults.Fallback[0].Id
+}
+
+func diagnosticContributors(contributions []hardcover.Contributions) []map[string]any {
+	out := make([]map[string]any, 0, len(contributions))
+	for _, contribution := range contributions {
+		out = append(out, map[string]any{
+			"authorID": contribution.Author.Id,
+			"role":     contribution.Contribution,
+		})
+	}
+	return out
 }
 
 func bestAuthor(contributions []hardcover.Contributions) (hardcover.ContributionsAuthorAuthors, error) {

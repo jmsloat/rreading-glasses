@@ -11,7 +11,8 @@ const (
 // edge represents a parent/child relationship. They are used for denormalizing
 // children to parent objects (works to authors, editions to works).
 type edge struct {
-	kind     edgeKind
-	parentID int64
-	childIDs set[int64]
+	kind       edgeKind
+	parentID   int64
+	childIDs   set[int64]
+	diagnostic *hardcoverDiagnosticRefresh
 }
